@@ -8,14 +8,12 @@ Create and authenticate integrations using the OpenAI library and the Google She
 
 **Server:** Python, Pandas, OpenAI, SYS, Logging, google.auth
 ## Google Sheets Integration
-
-This script authenticates and connects to a Google Sheets document, retrieves all records from the first worksheet (`sheet1`), and logs the operations.  It is intended for automated data retrieval processes.
+Connects to a Google Sheets document, retrieves records from the spreadsheet_id, and logs the operations for the automated data retrieval process.
 
 ### API Reference
 
 ```http
 GET /api/google-sheet/records
-
 ````
 
 | Parameter  | Type   | Description                                             |
