@@ -29,7 +29,7 @@ new_data = df[~df["ID do Pedido Yampi"].isin(processed_ids)]
 
 gestor_matches = df["Produto"].str.extractall(r"(?:[\(-]|\s-\s*)([A-Z]{2})(?:[\)-]|\s|$)")
 unique_managers = gestor_matches[0].dropna().unique()
-
+print(unique_managers)
 if len(unique_managers) == 0:
     logger.warning("Nenhum gestor detectado. Regex vazio, fallback ativado.")
     unique_managers = ["XX"]
