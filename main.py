@@ -6,6 +6,7 @@ from loguru import logger
 from services.openai_client import openai_client_authentication
 from services.sheets_client import google_client_authentication
 
+# Loading environment variables
 openai_key = os.getenv("OPENAI_API_KEY")
 google_credentials_path = os.getenv("GOOGLE_SHEETS_CREDENTIALS")
 sheet_id = os.getenv("SHEET_ID")
@@ -18,33 +19,28 @@ logger.info("Authenticating with OpenAI and Google Sheets.")
 openai_client = openai_client_authentication(openai_key)
 spreadsheet = google_client_authentication(google_credentials_path, sheet_id)
 
+logger.success("Authentication successful.")
+
+# Sheets
 sheet_raw = spreadsheet.worksheet("Dados Brutos")
 sheet_processed = spreadsheet.worksheet("Pedidos Processados")
 
 raw_data = sheet_raw.get_all_values()
+logger.info(f"Loaded raw data: {len(raw_data)-1} rows.")
+
 df = pd.DataFrame(raw_data[1:], columns=raw_data[0])
 
 processed_ids = set(sheet_processed.col_values(3)[1:])
+logger.info(f"Processed IDs: {len(processed_ids)}")
+
 new_data = df[~df["ID do Pedido Yampi"].isin(processed_ids)]
+logger.info(f"New orders to process: {len(new_data)}")
 
 new_data_cleaned = new_data.drop_duplicates(subset=["ID do Pedido Yampi"], keep="first")
-
 duplicates_removed = len(new_data) - len(new_data_cleaned)
 if duplicates_removed > 0:
-    logger.info(f"{duplicates_removed} duplicate orders removed.")
-
+    logger.warning(f"{duplicates_removed} duplicates removed.")
 new_data = new_data_cleaned
-
-gestor_matches = df["Produto"].str.extractall(r"(?:[\(-]|\s-\s*)([A-Za-z\s]+)(?:[\)-]|\s|$)")
-unique_managers = gestor_matches[0].dropna().unique()
-
-if len(unique_managers) == 0:
-    logger.warning("No managers detected. Empty regex, fallback activated.")
-    unique_managers = ["XX"]
-
-manager_regex = re.compile(r"(?:[\(-]|\s-\s*)(" + "|".join(map(re.escape, unique_managers)) + r")", re.I)
-quantity_regex = re.compile(r"(\d+)\s*(frasco|pote|unidade)", re.I)
-light_regex = re.compile(r"Leve\s*(\d+)", re.I)
 
 valid_products = [
     "Urocianina Gotas", "Insufree Gotas", "L-Nicotinina", "Evo Prost Gotas",
@@ -53,24 +49,40 @@ valid_products = [
     "Gliconix", "Maxprost", "Antocionidinol", "Glicofree"
 ]
 
-def extract_product_name(description: str) -> str:
-    prompt = f"""
-    Extract ONLY the correct product name from the following list:
-    {", ".join(valid_products)}.
-    Description: \"{description}\".
-    Return only the product name.
-    """
-    response = openai_client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "system", "content": prompt}],
-        temperature=0,
-        max_tokens=10
-    )
-    return response.choices[0].message.content.strip()
+manager_acronym_regex = re.compile(r"-\s*([A-Z]{2})\s*$")
+fallback_regex = re.compile(r"-\s*([A-Z]{2})\s*")
+quantity_regex = re.compile(r"(\d+)\s*(frasco|pote|unidade)", re.I)
+light_regex = re.compile(r"Leve\s*(\d+)", re.I)
 
+# Extract product name from description with improved matching
+def extract_product_name(description: str) -> str | None:
+    prompt = f"""
+    Dado o texto abaixo, extraia apenas o nome do produto com base nessa lista:
+    {", ".join(valid_products)}.
+    Texto: \"{description}\".
+    Retorne apenas o nome EXATO da lista, o mais próximo possível.
+    """
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "system", "content": prompt}],
+            temperature=0,
+            max_tokens=10
+        )
+        result = response.choices[0].message.content.strip()
+
+        for product in valid_products:
+            if product.lower() in result.lower() or result.lower() in product.lower():
+                return product
+        return None
+    except Exception as e:
+        logger.error(f"Error extracting product name: {e}")
+        return None
+
+# Parsing product info and generating order details
 def parse_product_info(product: str, quantity_raw: str):
-    manager_match = manager_regex.findall(product)
-    manager = manager_match[-1] if manager_match else "Unknown"
+    manager_match = manager_acronym_regex.search(product) or fallback_regex.search(product)
+    manager = manager_match.group(1) if manager_match else "XX"
 
     sale_type = (
         "Callcenter" if "CALL" in product else
@@ -95,6 +107,9 @@ def parse_product_info(product: str, quantity_raw: str):
         order_bump = "No"
 
     product_name = extract_product_name(product)
+    if not product_name:
+        logger.error(f"Invalid product name: {product}")
+        return None, None, None, None, None
 
     return manager, sale_type, product_name, quantity, order_bump
 
@@ -102,30 +117,35 @@ processed_rows = []
 logger.info(f"Processing {len(new_data)} new rows.")
 
 for _, row in new_data.iterrows():
-    manager, sale_type, product_name, quantity, order_bump = parse_product_info(row["Produto"], row["Quantidade"])
-    upsell = "Yes" if sale_type == "Upsell" and order_bump == "No" else "No"
+    try:
+        manager, sale_type, product_name, quantity, order_bump = parse_product_info(row["Produto"], row["Quantidade"])
 
-    processed_rows.append([
-        row["Data de Criação"],
-        row["Data de Pagamento"],
-        row["ID do Pedido Yampi"],
-        manager,
-        sale_type,
-        upsell,
-        order_bump,
-        row["Cliente"],
-        row["Email"],
-        row["Produto"],
-        product_name,
-        quantity,
-        row["Valor Total"],
-        row["Status"],
-        row["Método de Pagamento"]
-    ])
+        if product_name is None:
+            continue
 
-if processed_rows:
-    last_row = len(sheet_processed.col_values(1))
-    logger.info(f"Updating {len(processed_rows)} rows in the processed sheet.")
-    sheet_processed.update(processed_rows, range_name=f"A{last_row+1}")
+        upsell = "Yes" if sale_type == "Upsell" and order_bump == "No" else "No"
+
+        processed_rows.append([
+            row["Data de Criação"],
+            row["Data de Pagamento"],
+            row["ID do Pedido Yampi"],
+            manager,
+            sale_type,
+            upsell,
+            order_bump,
+            row["Cliente"],
+            row["Email"],
+            row["Produto"],
+            product_name,
+            quantity,
+            row["Valor Total"]
+        ])
+
+    except Exception as e:
+        logger.error(f"Error processing row {row['ID do Pedido Yampi']}: {e}")
+
+# Update processed sheet with new order data
+logger.info(f"Updating {len(processed_rows)} rows in the processed sheet.")
+sheet_processed.append_rows(processed_rows)
 
 logger.success("Process completed successfully.")
